@@ -23,6 +23,8 @@ python build_time_locked_nuitka.py `
     --exclude-compile "dkvis_exploration_tool.py"
 </code>
 # Command to build including JSONs (does not work yet)
+
+<code>
 python build_time_locked_nuitka.py `
     --cutoff 2026-08-19 `
     --src "C:/temp/bess-platform-0.9.4/BESS_framework" `
@@ -33,7 +35,7 @@ python build_time_locked_nuitka.py `
     --exclude-compile "./*.py" `
     --exclude-compile "exploratory dashboard/dkvis_exploration_tool.py" `
     --embed-json "**/*.json"
-    
+</code>    
 
 # install uv without admin (or: pip install uv / pipx install uv)
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
