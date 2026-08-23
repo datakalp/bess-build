@@ -9,6 +9,7 @@ pip install nuitka
 cd .\Dell-laptop-bkup-13-May-2025\Datakalp\Datakriti\ANIL\CogniBESS\time_locked_build\
 
 # Command to build while keeping JSONs open
+<code>
 python build_time_locked_nuitka.py `
     --cutoff 2026-08-19 `
     --src "C:/temp/BESS_framework" `
@@ -20,7 +21,7 @@ python build_time_locked_nuitka.py `
     --exclude-compile "soc_energy_balance_check.py" `
     --exclude-compile "pcs_energy_soc_balance.py" `
     --exclude-compile "dkvis_exploration_tool.py"
-
+</code>
 # Command to build including JSONs (does not work yet)
 python build_time_locked_nuitka.py `
     --cutoff 2026-08-19 `
