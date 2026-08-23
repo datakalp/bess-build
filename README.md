@@ -39,11 +39,13 @@ python build_time_locked_nuitka.py `
 </code>    
 
 # install uv without admin (or: pip install uv / pipx install uv)
+<code>
 powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 uv python install 3.12        # fetches a standalone CPython 3.12 into %LOCALAPPDATA%\uv
 uv venv --python 3.12 myenv   # venv pinned to that version
 myenv\Scripts\activate
+</code>
 
 # Why JSONs cannot be bundled yet
     core_libraries\bess_6d_analysis.py:795  json.load(<handle>) opens a fully-dynamic path — handle manually
