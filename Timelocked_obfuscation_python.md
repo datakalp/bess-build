@@ -380,3 +380,76 @@ Safety rules (unchanged philosophy — never break code silently):
 Reused handles across independent `with` blocks in the same function are each
 rewritten correctly. The build still prints a summary of every call rewritten
 and every one you should review.
+
+
+## The build now STOPS if an embedded JSON is still referenced
+
+You were right to worry about this. When a JSON is embedded it is deleted from
+`dist`, so any `json.load(open("that.json"))` / bare `open("that.json")` /
+`pandas.read_json("that.json")` that was **not** rewritten would crash at
+runtime with `FileNotFoundError`. (It compiles fine — the failure is at
+runtime.) To prevent shipping a broken binary, the build now classifies every
+leftover reference:
+
+- **Confirmed-broken** — a reference to a file that *was* embedded but could not
+  be rewritten (handle used more than once, ambiguous name, an unrecognised load
+  pattern, a bare `open`, or `read_json`). The build **stops** and lists each
+  one, before compiling anything.
+- **Uncertain** — a fully-dynamic path (filename only known at runtime) or a
+  non-UTF-8 source. These may point to a non-embedded file that is still present,
+  so they are printed as **warnings** and the build continues.
+
+A backstop scan catches references even from load patterns the rewriter doesn't
+recognise: any remaining read-mode `open()` or `read_json()` of an embedded file
+is treated as confirmed-broken.
+
+When the build stops you get actionable choices:
+
+```
+Build stopped: 1 reference(s) to embedded JSON could not be rewritten ...
+    reader.py:5  'config.json' is embedded but file handle 'f' is used more
+                 than once in the with-block — cannot safely rewrite
+
+Fix options:
+  - edit those call sites to load the compiled data module
+    (e.g. `from <pkg>.<stem>_json import load`), or
+  - drop those files from --embed-json so they ship as .json, or
+  - re-run with --allow-unrewritten-embedded-json to build anyway
+    (NOT recommended; the binary will crash at those calls).
+```
+
+`--allow-unrewritten-embedded-json` downgrades the stop to a warning and builds
+anyway (only sensible if you know the offending code paths never execute).
+
+
+## `--diagnose-chained-assignment` (locate CoW false positives in the build)
+
+Because pandas' chained-assignment detector uses CPython frame introspection
+that Nuitka doesn't replicate, compiled builds emit `ChainedAssignmentError`
+false positives on ordinary `df[col] = value` lines — and the reported line
+number is unreliable (guard injection and your own edits shift it). This flag
+injects a runtime diagnostic into the **guard** (so it's bundle-only; dev runs
+the raw source and is unaffected) that prints, to stderr, the *column name*
+being assigned plus the file/line pandas attributes it to:
+
+```
+>>> [ChainedAssignment] assigning 'active_loss' at core_libraries/bess_rte_from_sessions.py:756
+```
+
+The column name is the reliable locator (read from interpreted pandas'
+`__setitem__` frame); use it to find the `frame["<column>"] = <value>` line and
+convert it to `frame = frame.assign(<column>=<value>)` (or, for a computed
+name, `frame = frame.assign(**{<expr>: <value>})`).
+
+```bash
+python build_time_locked_nuitka.py --cutoff 2027-01-31 --src .\yourcode \
+    --diagnose-chained-assignment
+```
+
+Off by default (it writes to stderr on every occurrence, so leave it out of a
+release build). Pair it with a dev-side gate —
+`warnings.filterwarnings("error", category=pandas.errors.ChainedAssignmentError)`
+in your dev/CI runs — so any *genuine* chained assignment (a real
+`df[a][b] = ...` whose write is silently lost) is caught accurately in dev,
+where there are no false positives. The build prints a reminder when the
+diagnostic is compiled in, so you don't ship it by accident.
