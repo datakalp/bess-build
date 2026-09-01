@@ -253,6 +253,52 @@ def _install_once():
         pass
 
 _install_once()
+__CAE_DIAGNOSTIC__
+'''
+
+
+# Injected into the guard only when --diagnose-chained-assignment is passed.
+# Runs at guard import (i.e. in the compiled bundle only, since dev runs the raw
+# source without the guard). Reports each ChainedAssignmentError with the column
+# being assigned and the file/line pandas attributes it to.
+_CAE_DIAGNOSTIC_CODE = '''
+def _install_cae_diagnostic():
+    import warnings as _w, sys as _sys
+    try:
+        from pandas.errors import ChainedAssignmentError as _CAE
+    except Exception:
+        return
+    _orig_show = _w.showwarning
+    def _show(message, category, filename, lineno, file=None, line=None):
+        try:
+            _hit = isinstance(category, type) and issubclass(category, _CAE)
+        except Exception:
+            _hit = False
+        if _hit:
+            _key = "<not found>"
+            _cols = None
+            _f = _sys._getframe()
+            while _f is not None:
+                if _f.f_code.co_name == "__setitem__" and "key" in _f.f_locals:
+                    try:
+                        _key = repr(_f.f_locals.get("key"))
+                    except Exception:
+                        _key = "<unreadable>"
+                    try:
+                        _cols = list(_f.f_locals.get("self").columns)
+                    except Exception:
+                        _cols = None
+                    break
+                _f = _f.f_back
+            print(">>> [ChainedAssignment] assigning " + _key
+                  + " at " + str(filename) + ":" + str(lineno)
+                  + ((" (columns: " + repr(_cols) + ")") if _cols is not None else ""),
+                  file=_sys.stderr)
+        return _orig_show(message, category, filename, lineno, file, line)
+    _w.showwarning = _show
+    _w.filterwarnings("always", category=_CAE)
+
+_install_cae_diagnostic()
 '''
 
 
@@ -510,42 +556,35 @@ def _dotted_import_hint(staging: Path, py_rel: Path) -> str:
 
 def _rewrite_json_loads(staging: Path,
                         embedded_by_basename: dict,
-                        generated_data_modules: set) -> tuple[list, list]:
+                        generated_data_modules: set) -> tuple[list, list, list]:
     """Rewrite json.load/json.loads of embedded JSON files to use the compiled
     data module instead of opening a file that no longer exists.
 
-    embedded_by_basename maps a JSON basename (e.g. "config.json") to a list of
-    dicts: {"rel": <staging-relative json path>, "modstem": <e.g. config_json>,
-    "dotted": <import path e.g. pkg.config_json>}.
+    Returns (rewritten, broken, uncertain):
+      rewritten : "file:line  pattern  ->  module" for calls we rewrote.
+      broken    : "file:line  reason" for references to an embedded (now-deleted)
+                  file that we could NOT rewrite. These WILL crash at runtime, so
+                  the build must stop unless the user overrides.
+      uncertain : "file:line  reason" for calls we could not classify (e.g. a
+                  fully-dynamic path that may point to a non-embedded file that is
+                  still present). These are warnings, not hard failures.
 
-    Returns (rewritten, review):
-      rewritten : list of "file:line  pattern  ->  module" strings
-      review    : list of "file:line  reason" strings for calls a human should
-                  check.
-
-    Handled patterns (the path may be a plain string literal OR an expression
-    such as os.path.join(HERE, "config.json") / Path(__file__).parent /
-    "config.json" — in which case the *filename* literal inside the expression
-    is used to match an embedded file):
-
-        data = json.load(open(PATH[, ...]))
-        data = json.loads(open(PATH[, ...]).read())
-        data = json.loads(Path(PATH).read_text([...]))          # + .parent/.joinpath chains
-        with open(PATH[, ...]) as f:      # single item; f used only by the load
-            ...
-            data = json.load(f)           # (body may have other statements)
-        f = open(PATH[, ...])             # simple assignment form
-        data = json.load(f)               # f used only by the load (+ optional f.close())
-
-    Only loads whose resolved filename matches an embedded JSON are touched;
-    loads of non-embedded JSON, and non-file json.loads (e.g.
-    json.loads(meta[b"pandas"])), are left exactly as-is.
+    Handled patterns (path may be a literal or an expression whose filename
+    literal is used, e.g. os.path.join(HERE, "config.json")):
+        json.load(open(PATH[, ...]))
+        json.loads(open(PATH[, ...]).read())
+        json.loads(Path(PATH).read_text([...]))
+        with open(PATH[, ...]) as f: ... json.load(f) ...   (f used only by load)
+        f = open(PATH[, ...]); ...; json.load(f); [f.close()]
+    Non-file json.loads (e.g. json.loads(meta[b"pandas"])) and loads of
+    non-embedded JSON are left exactly as-is.
     """
     rewritten: list = []
-    review: list = []
+    broken: list = []
+    uncertain: list = []
 
     if not embedded_by_basename:
-        return rewritten, review
+        return rewritten, broken, uncertain
 
     for py in sorted(staging.rglob("*.py")):
         rel = py.relative_to(staging)
@@ -558,8 +597,8 @@ def _rewrite_json_loads(staging: Path,
             text = raw.decode("utf-8-sig") if had_bom else raw.decode("utf-8")
         except UnicodeDecodeError:
             if b"json" in raw and b"load" in raw:
-                review.append(f"{rel}  (non-UTF-8 source; json.load calls not "
-                              f"auto-rewritten — edit manually)")
+                uncertain.append(f"{rel}  (non-UTF-8 source; not scanned — if it loads an "
+                                 f"embedded JSON it will crash; edit manually)")
             continue
 
         try:
@@ -567,7 +606,6 @@ def _rewrite_json_loads(staging: Path,
         except SyntaxError:
             continue
 
-        # parent links
         for parent in ast.walk(tree):
             for child in ast.iter_child_nodes(parent):
                 child.parent = parent
@@ -580,7 +618,6 @@ def _rewrite_json_loads(staging: Path,
         def abs_off(lineno: int, col: int) -> int:
             return line_starts[lineno - 1] + col
 
-        # ---- resolve which names refer to json / load / loads / Path -------
         json_mods: set = set()
         load_names: dict = {}
         path_names: set = set()
@@ -630,9 +667,6 @@ def _rewrite_json_loads(staging: Path,
             return n.value if isinstance(n, ast.Constant) and isinstance(n.value, str) else None
 
         def filename_from_pathexpr(node):
-            """Return the basename of the best string-literal filename found in a
-            path expression, or None if the expression contains no string literal
-            (i.e. the path is fully dynamic)."""
             if node is None:
                 return None
             direct = lit_str(node)
@@ -694,8 +728,6 @@ def _rewrite_json_loads(staging: Path,
             return tree
 
         def stmt_block_of(node):
-            """Return (list, index) for the nearest ancestor statement that lives
-            in a body-like list."""
             cur = node
             p = getattr(cur, "parent", None)
             while p is not None:
@@ -710,9 +742,22 @@ def _rewrite_json_loads(staging: Path,
             return [n for n in ast.walk(scope)
                     if isinstance(n, ast.Name) and n.id == name and isinstance(n.ctx, ast.Load)]
 
+        def open_is_readmode(call):
+            mode = None
+            if len(call.args) >= 2:
+                mode = lit_str(call.args[1])
+            for kw in call.keywords:
+                if kw.arg == "mode":
+                    mode = lit_str(kw.value)
+            if mode is None:
+                return True  # default mode is 'r'
+            return not any(c in mode for c in ("w", "a", "x", "+"))
+
         edits: list = []
         used_modules: dict = {}
         handled_calls: set = set()
+        consumed_opens: set = set()   # open() nodes rewritten away
+        flagged_opens: set = set()    # open() nodes already reported as broken
 
         def neutralize_with(w):
             it = w.items[0]
@@ -722,7 +767,7 @@ def _rewrite_json_loads(staging: Path,
             wstart = abs_off(w.lineno, w.col_offset)
             edits.append((wstart, colon_idx + 1, b"if True:"))
 
-        # ---- (A) file-handle loads: json.load(NAME) / json.loads(NAME.read())
+        # ---- (A) file-handle loads ---------------------------------------
         for call in [n for n in ast.walk(tree) if isinstance(n, ast.Call)]:
             if id(call) in handled_calls:
                 continue
@@ -738,7 +783,7 @@ def _rewrite_json_loads(staging: Path,
                   and isinstance(arg.func.value, ast.Name)):
                 var = arg.func.value.id
             if var is None:
-                continue  # not a file-handle form (inline section or leave alone)
+                continue
 
             mech = None
             open_call = None
@@ -757,37 +802,40 @@ def _rewrite_json_loads(staging: Path,
                                 and st.targets[0].id == var and is_open_call(st.value)):
                             mech, open_call, asg = "assign", st.value, (block, j, st)
                             break
-                        # if var is reassigned to something else first, stop
                         if (isinstance(st, ast.Assign) and any(
                                 isinstance(t, ast.Name) and t.id == var for t in st.targets)):
                             break
             if open_call is None:
-                continue  # can't trace the handle; leave alone
+                continue
 
             fname = filename_from_pathexpr(open_call.args[0]) if open_call.args else None
             if fname is None:
-                review.append(f"{rel}:{call.lineno}  json.{kind}(<handle>) opens a "
-                              f"fully-dynamic path — handle manually")
+                uncertain.append(f"{rel}:{call.lineno}  json.{kind}(<file handle>) opens a "
+                                 f"fully-dynamic path — if that resolves to an embedded JSON it "
+                                 f"will crash; otherwise ignore")
                 continue
             base = fname
             if base not in embedded_by_basename:
-                continue  # not embedded: leave alone
+                continue
             res = resolve(base, fname)
             if res in (None, "AMBIGUOUS"):
                 if res == "AMBIGUOUS":
-                    review.append(f"{rel}:{call.lineno}  filename '{base}' is ambiguous "
-                                  f"among embedded files — handle manually")
+                    broken.append(f"{rel}:{call.lineno}  '{base}' is embedded but the name is "
+                                  f"ambiguous among embedded files — cannot rewrite")
+                    flagged_opens.add(id(open_call))
                 continue
             modstem, dotted = res
 
             if mech == "with":
                 loads = name_loads(w, var)
                 if len(loads) != 1:
-                    review.append(f"{rel}:{call.lineno}  file handle '{var}' is used more "
-                                  f"than once inside the with-block — handle manually")
+                    broken.append(f"{rel}:{call.lineno}  '{base}' is embedded but file handle "
+                                  f"'{var}' is used more than once in the with-block — cannot "
+                                  f"safely rewrite")
+                    flagged_opens.add(id(open_call))
                     continue
                 neutralize_with(w)
-            else:  # assign
+            else:
                 scope = enclosing_scope(call)
                 loads = name_loads(scope, var)
                 close_calls = [n for n in ast.walk(scope)
@@ -795,8 +843,9 @@ def _rewrite_json_loads(staging: Path,
                                and n.func.attr == "close" and isinstance(n.func.value, ast.Name)
                                and n.func.value.id == var]
                 if len(loads) != 1 + len(close_calls):
-                    review.append(f"{rel}:{call.lineno}  file handle '{var}' has other uses "
-                                  f"— handle manually")
+                    broken.append(f"{rel}:{call.lineno}  '{base}' is embedded but file handle "
+                                  f"'{var}' has other uses — cannot safely rewrite")
+                    flagged_opens.add(id(open_call))
                     continue
                 os_ = abs_off(open_call.lineno, open_call.col_offset)
                 oe_ = abs_off(open_call.end_lineno, open_call.end_col_offset)
@@ -812,9 +861,10 @@ def _rewrite_json_loads(staging: Path,
             ce = abs_off(call.end_lineno, call.end_col_offset)
             edits.append((cs, ce, f"{alias}.load()".encode("utf-8")))
             handled_calls.add(id(call))
+            consumed_opens.add(id(open_call))
             rewritten.append(f"{rel}:{call.lineno}  json.{kind}(<file handle>) -> {dotted}")
 
-        # ---- (B) inline expressions ---------------------------------------
+        # ---- (B) inline expressions --------------------------------------
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or id(node) in handled_calls:
                 continue
@@ -823,19 +873,20 @@ def _rewrite_json_loads(staging: Path,
                 continue
             arg = node.args[0]
             fname = None
+            open_node = None
             if kind == "load" and is_open_call(arg) and arg.args:
-                fname = filename_from_pathexpr(arg.args[0])
+                fname = filename_from_pathexpr(arg.args[0]); open_node = arg
             elif kind == "loads" and isinstance(arg, ast.Call) and isinstance(arg.func, ast.Attribute):
                 recv = arg.func.value
                 if arg.func.attr == "read" and is_open_call(recv) and recv.args:
-                    fname = filename_from_pathexpr(recv.args[0])
+                    fname = filename_from_pathexpr(recv.args[0]); open_node = recv
                 elif arg.func.attr == "read_text":
                     fname = filename_from_pathexpr(recv)
 
             if fname is None:
                 if kind == "load" and is_open_call(arg) and arg.args:
-                    review.append(f"{rel}:{node.lineno}  json.load(open(<fully-dynamic>)) "
-                                  f"— cannot match to an embedded file; review manually")
+                    uncertain.append(f"{rel}:{node.lineno}  json.load(open(<fully-dynamic>)) — "
+                                     f"if that resolves to an embedded JSON it will crash")
                 continue
 
             base = fname
@@ -844,8 +895,10 @@ def _rewrite_json_loads(staging: Path,
             res = resolve(base, fname)
             if res in (None, "AMBIGUOUS"):
                 if res == "AMBIGUOUS":
-                    review.append(f"{rel}:{node.lineno}  filename '{base}' is ambiguous "
-                                  f"among embedded files — review manually")
+                    broken.append(f"{rel}:{node.lineno}  '{base}' is embedded but the name is "
+                                  f"ambiguous among embedded files — cannot rewrite")
+                    if open_node is not None:
+                        flagged_opens.add(id(open_node))
                 continue
             modstem, dotted = res
             used_modules[modstem] = dotted
@@ -853,22 +906,39 @@ def _rewrite_json_loads(staging: Path,
             start = abs_off(node.lineno, node.col_offset)
             end = abs_off(node.end_lineno, node.end_col_offset)
             edits.append((start, end, f"{alias}.load()".encode("utf-8")))
+            if open_node is not None:
+                consumed_opens.add(id(open_node))
             rewritten.append(f"{rel}:{node.lineno}  {kind}(...) -> {dotted}")
+
+        # ---- (C) backstop: any remaining reference to an embedded file ----
+        for call in [n for n in ast.walk(tree) if isinstance(n, ast.Call)]:
+            # bare open() of an embedded file in read mode, not handled above
+            if is_open_call(call) and id(call) not in consumed_opens and id(call) not in flagged_opens:
+                fn = filename_from_pathexpr(call.args[0]) if call.args else None
+                if fn and fn in embedded_by_basename and open_is_readmode(call):
+                    broken.append(f"{rel}:{call.lineno}  open('{fn}') reads a JSON that was "
+                                  f"embedded and removed, but this open() was not rewritten "
+                                  f"(unrecognised load pattern) — build would crash at runtime")
+            # pandas.read_json / <x>.read_json of an embedded file
+            f = call.func
+            if isinstance(f, ast.Attribute) and f.attr == "read_json" and call.args:
+                fn = filename_from_pathexpr(call.args[0])
+                if fn and fn in embedded_by_basename:
+                    broken.append(f"{rel}:{call.lineno}  read_json('{fn}') reads a JSON that was "
+                                  f"embedded and removed — read_json is not auto-rewritten; "
+                                  f"exclude this file from --embed-json or load it differently")
 
         if not edits:
             continue
 
-        # ---- apply edits bottom-to-top ------------------------------------
         edits.sort(key=lambda e: e[0], reverse=True)
-        # guard against overlaps (shouldn't happen, but be safe)
         out = src_bytes
         last_start = None
         safe_edits = []
         for start, end, repl in edits:
             if last_start is not None and end > last_start:
-                # overlapping edit; skip this one and flag
-                review.append(f"{rel}  (overlapping rewrite skipped near byte {start}; "
-                              f"review manually)")
+                broken.append(f"{rel}  (overlapping rewrite near byte {start} was skipped; "
+                              f"a load of an embedded file may remain — review manually)")
                 continue
             safe_edits.append((start, end, repl))
             last_start = start
@@ -876,12 +946,10 @@ def _rewrite_json_loads(staging: Path,
             out = out[:start] + repl + out[end:]
         new_text = out.decode("utf-8")
 
-        # ---- add the imports for the modules we used ----------------------
         try:
             insert_after = _future_and_docstring_end_line(new_text)
         except SyntaxError as e:
-            review.append(f"{rel}  (auto-rewrite produced invalid code and was "
-                          f"skipped: {e}); edit manually")
+            broken.append(f"{rel}  (auto-rewrite produced invalid code: {e}); edit manually")
             continue
         import_lines = [f"import {dotted} as {alias_for(modstem)}\n"
                         for modstem, dotted in sorted(used_modules.items())]
@@ -898,8 +966,7 @@ def _rewrite_json_loads(staging: Path,
         try:
             ast.parse(new_text)
         except SyntaxError as e:
-            review.append(f"{rel}  (auto-rewrite produced invalid syntax and was "
-                          f"skipped: {e}); edit manually")
+            broken.append(f"{rel}  (auto-rewrite produced invalid syntax: {e}); edit manually")
             continue
 
         data_out = new_text.encode("utf-8")
@@ -907,7 +974,7 @@ def _rewrite_json_loads(staging: Path,
             data_out = b"\xef\xbb\xbf" + data_out
         py.write_bytes(data_out)
 
-    return rewritten, review
+    return rewritten, broken, uncertain
 
 # Python bytecode caches are never part of a Nuitka build and must never reach
 # dist — a stray .pyc is a decompilable copy of source. We drop these
@@ -1015,7 +1082,9 @@ def _discover_compile_units(root: Path) -> tuple[list[Path], list[Path]]:
 def build(cutoff: str, src: Path, output: Path, jobs: int,
           exclude_all: list[str], exclude_compile: list[str],
           embed_json: list[str], json_encoding=None,
-          rewrite_json_loads: bool = True) -> None:
+          rewrite_json_loads: bool = True,
+          allow_unrewritten_embedded_json: bool = False,
+          diagnose_chained_assignment: bool = False) -> None:
     if not src.is_dir():
         sys.exit(f"--src is not a directory: {src}")
     try:
@@ -1168,21 +1237,51 @@ def build(cutoff: str, src: Path, output: Path, jobs: int,
     # data modules exist and the .json files are gone. Skippable.
     # ------------------------------------------------------------------
     if embedded_by_basename and rewrite_json_loads:
-        rw, review = _rewrite_json_loads(staging, embedded_by_basename,
-                                         generated_data_modules)
+        rw, broken, uncertain = _rewrite_json_loads(staging, embedded_by_basename,
+                                                    generated_data_modules)
         if rw:
             print(f"Auto-rewrote {len(rw)} json.load/loads call(s) to use embedded "
                   f"data modules:")
             for line in rw:
                 print(f"    {line}")
-        if review:
-            print(f"⚠ {len(review)} json.load/loads call(s) need a manual look "
-                  f"(not auto-rewritten):")
-            for line in review:
+        if uncertain:
+            print(f"⚠ {len(uncertain)} json.load/loads call(s) could not be classified "
+                  f"(dynamic path or non-UTF-8 source) — review if they load an embedded file:")
+            for line in uncertain:
                 print(f"    {line}")
-        if not rw and not review:
+        if not rw and not broken and not uncertain:
             print("No json.load/loads calls referencing embedded files were found "
                   "to rewrite.")
+        if broken:
+            # These reference JSON that was embedded (and deleted from dist) but
+            # could not be rewritten. The compiled program WOULD crash at runtime
+            # with FileNotFoundError. Stop the build unless explicitly overridden.
+            header = (f"{len(broken)} reference(s) to embedded JSON could not be "
+                      f"rewritten and would crash at runtime:")
+            for line in broken:
+                print(f"    {line}")
+            if allow_unrewritten_embedded_json:
+                print(f"⚠ {header}")
+                print("  Proceeding anyway because --allow-unrewritten-embedded-json was "
+                      "given. The resulting binary will fail when it hits these calls "
+                      "unless you fix them or the code paths are never executed.")
+            else:
+                # Clean up scratch dirs before aborting.
+                for scratch in (staging, output.parent / (output.name + ".guard")):
+                    try:
+                        shutil.rmtree(scratch)
+                    except Exception:
+                        pass
+                sys.exit(
+                    f"\nBuild stopped: {header}\n"
+                    + "\n".join(f"    {line}" for line in broken)
+                    + "\n\nFix options:\n"
+                    "  - edit those call sites to load the compiled data module "
+                    "(e.g. `from <pkg>.<stem>_json import load`), or\n"
+                    "  - drop those files from --embed-json so they ship as .json, or\n"
+                    "  - re-run with --allow-unrewritten-embedded-json to build anyway "
+                    "(NOT recommended; the binary will crash at those calls).\n"
+                )
 
     # Write the guard into a SEPARATE staging-sibling directory so it is never
     # accidentally swept into a package's compilation (which happens if the
@@ -1192,6 +1291,11 @@ def build(cutoff: str, src: Path, output: Path, jobs: int,
     guard_source = GUARD_TEMPLATE
     for k, v in parts.items():
         guard_source = guard_source.replace(k, str(v))
+    # Inject the chained-assignment diagnostic into the guard (bundle-only) when
+    # requested; otherwise strip the placeholder.
+    guard_source = guard_source.replace(
+        "__CAE_DIAGNOSTIC__",
+        _CAE_DIAGNOSTIC_CODE if diagnose_chained_assignment else "")
     guard_staging = output.parent / (output.name + ".guard")
     if guard_staging.exists():
         shutil.rmtree(guard_staging)
@@ -1415,6 +1519,10 @@ def build(cutoff: str, src: Path, output: Path, jobs: int,
             print(f"      {j}")
         print("    To embed these as compiled data modules, add e.g. "
               "--embed-json \"**/*.json\"")
+    if diagnose_chained_assignment:
+        print("  NOTE: chained-assignment diagnostic is COMPILED INTO this build — it "
+              "prints to stderr on every ChainedAssignmentError. Rebuild without "
+              "--diagnose-chained-assignment for a clean release.")
     print(f"\n  Ship the '{output.name}/' directory as-is.")
 
 def main() -> None:
@@ -1450,10 +1558,25 @@ def main() -> None:
                    help="Disable automatic rewriting of json.load()/json.loads() calls "
                         "that read an embedded JSON file. By default such calls are "
                         "rewritten to import the compiled data module instead.")
+    p.add_argument("--allow-unrewritten-embedded-json", action="store_true",
+                   help="Build even if some json.load/open of an embedded (removed) JSON "
+                        "could not be rewritten. NOT recommended: the resulting binary "
+                        "will raise FileNotFoundError at those call sites. By default the "
+                        "build stops and lists them.")
+    p.add_argument("--diagnose-chained-assignment", action="store_true",
+                   help="Inject a runtime diagnostic into the bundle that prints, to "
+                        "stderr, the column name and pandas-attributed file:line for every "
+                        "ChainedAssignmentError. Bundle-only (dev runs the raw source, "
+                        "unaffected). Off by default. Use it to locate the assignments to "
+                        "convert to .assign(); pair it with a dev-side "
+                        "filterwarnings('error', ChainedAssignmentError) gate to catch "
+                        "genuine chained assignments accurately.")
     args = p.parse_args()
     build(args.cutoff, args.src.resolve(), args.output.resolve(), args.jobs,
           args.exclude_all, args.exclude_compile, args.embed_json, args.json_encoding,
-          rewrite_json_loads=not args.no_rewrite_json_loads)
+          rewrite_json_loads=not args.no_rewrite_json_loads,
+          allow_unrewritten_embedded_json=args.allow_unrewritten_embedded_json,
+          diagnose_chained_assignment=args.diagnose_chained_assignment)
 
 if __name__ == "__main__":
     main()
