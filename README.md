@@ -8,19 +8,24 @@ pip install nuitka
 
 cd .\Dell-laptop-bkup-13-May-2025\Datakalp\Datakriti\ANIL\CogniBESS\time_locked_build\
 
-# Command to build while keeping JSONs open
+# Activate the environment before building
+The build requires PowerShell. Run myenv\Scripts\Activate.ps1 in the powershell to activate the environment. 
+The usual myenv\Scripts\activate.bat does not work in powershell. 
+Verify that the environment is active by looking for the (myenv) prefix on the prompt.
+
+# Command to build while keeping JSONs open, chain-assignment-diagnosis enabled
 <code>
-python build_time_locked_nuitka.py `
-    --cutoff 2026-08-19 `
-    --src "C:/temp/BESS_framework" `
-    --exclude-all "Test_suites/**" `
-    --exclude-all "outputs/**" `
-    --exclude-all "*.md" `
-    --exclude-all "**/*.md" `
-    --exclude-compile "run_*.py" `
-    --exclude-compile "soc_energy_balance_check.py" `
-    --exclude-compile "pcs_energy_soc_balance.py" `
-    --exclude-compile "dkvis_exploration_tool.py"
+(myenv) PS C:\temp\time_locked_build> python build_time_locked_nuitka.py `
+     --cutoff 2026-08-31 `
+     --src "C:/temp/bess-platform-0.9.11/BESS_framework" `
+     --exclude-all "Test_suites/**" `
+     --exclude-all "parsing_scripts/**" `
+     --exclude-all "outputs/**" `
+     --exclude-all "*.md" `
+     --exclude-all "**/*.md" `
+     --exclude-compile "./*.py" `
+     --exclude-compile "exploratory dashboard/dkvis_exploration_tool.py" `
+     --diagnose-chained-assignment
 </code>
 
 # Command to build including JSONs (does not work yet)
